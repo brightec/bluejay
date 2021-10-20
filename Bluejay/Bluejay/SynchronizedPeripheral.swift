@@ -441,6 +441,97 @@ public class SynchronizedPeripheral {
         }
     }
 
+    /**
+     Similar to `writeAndListen`, but use this if you don't know or don't have control over how many packets will be sent to you. This allows you to specify an end character to listen for.
+     */
+    public func writeAndAssemble<S: Sendable, R: Receivable>( // swiftlint:disable:this cyclomatic_complexity
+        writeTo charToWriteTo: CharacteristicIdentifier,
+        value: S,
+        listenTo charToListenTo: CharacteristicIdentifier,
+        expectedEndByte: UInt8,
+        timeoutInSeconds: Int = 0,
+        completion: @escaping (R) -> ListenAction) throws {
+        let sem = DispatchSemaphore(value: 0)
+
+        var listenResult: ReadResult<Data>?
+        var writeAndAssembleError: Error?
+
+        var assembledData = Data()
+
+        backupTermination = { bluejayError in
+            writeAndAssembleError = bluejayError
+            sem.signal()
+        }
+
+        DispatchQueue.main.sync {
+            self.parent.listen(to: charToListenTo, multipleListenOption: .trap) { (result: ReadResult<Data>) in
+                listenResult = result
+                var action = ListenAction.keepListening
+
+                switch result {
+                case .success(let data):
+                    assembledData.append(data)
+                    if assembledData.last == expectedEndByte {
+                        do {
+                            action = completion(try R(bluetoothData: assembledData))
+                        } catch {
+                            writeAndAssembleError = error
+                        }
+                    } else {
+                        self.debugLog("Need to continue to assemble data.")
+                    }
+                case .failure(let error):
+                    writeAndAssembleError = error
+                }
+
+                if writeAndAssembleError != nil || action == .done {
+                    if self.parent.isListening(to: charToListenTo) && self.bluetoothAvailable {
+                        self.parent.endListen(to: charToListenTo, error: nil) { result in
+                            switch result {
+                            case .success:
+                                break
+                            case .failure(let error):
+                                // Don't overwrite the more important error from the original listen call.
+                                if writeAndAssembleError == nil {
+                                    writeAndAssembleError = error
+                                }
+                            }
+
+                            sem.signal()
+                        }
+                    } else {
+                        sem.signal()
+                    }
+                }
+            }
+
+            self.parent.write(to: charToWriteTo, value: value) { result in
+                switch result {
+                case .success:
+                    return
+                case .failure(let error):
+                    writeAndAssembleError = error
+                    sem.signal()
+                }
+            }
+        }
+
+        let waitResult = sem.wait(timeout: timeoutInSeconds == 0 ? .distantFuture : .now() + .seconds(timeoutInSeconds))
+
+        if let error = writeAndAssembleError {
+            backupTermination = nil
+            throw error
+        } else if waitResult == .timedOut || listenResult == nil {
+            backupTermination = nil
+
+            if self.parent.isListening(to: charToListenTo) && self.bluetoothAvailable {
+                self.parent.endListen(to: charToListenTo)
+            }
+
+            throw BluejayError.listenTimedOut
+        }
+    }
+
     /// Ask for the peripheral's maximum payload length in bytes for a single write request.
     public func maximumWriteValueLength(`for` writeType: CBCharacteristicWriteType) -> Int {
         return parent.maximumWriteValueLength(for: writeType)
